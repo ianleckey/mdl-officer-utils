@@ -3,7 +3,8 @@
 //! network never freezes the screen.
 //!
 //! Keys: u upload now · t token · f folder · d detect folder · ↑↓ PgUp PgDn scroll
-//! the events · q (or Ctrl-C) quit.
+//! the events · c check for app updates · r restart into an installed update ·
+//! q (or Ctrl-C) quit.
 
 use std::io;
 use std::path::PathBuf;
@@ -30,8 +31,17 @@ use crate::config::Config;
 use crate::eventlog::{self, Level};
 use crate::game;
 use crate::lfg::Run;
+use crate::update::Stage;
 use crate::{report, schedule};
 use crate::worker::{AccountState, Command, LfgView, Phase, Service, Status, Upload};
+
+/// How the dashboard ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    Quit,
+    /// The officer pressed `r` with an update installed: start the new version.
+    Restart,
+}
 
 /// What the keyboard is doing right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +56,8 @@ enum Mode {
 /// The dashboard's own state (everything else comes from `Status`).
 struct Ui {
     tx: Sender<Command>,
+    /// Wakes the update thread for a check now (the `c` key).
+    check_updates: Sender<()>,
     // Our copies of the settings. Changing one sends both to the worker, which
     // saves them and starts over.
     token: String,
@@ -59,7 +71,9 @@ struct Ui {
     log_path: Option<PathBuf>,
     /// The guild crest fills the screen until then (any key skips it).
     splash_until: Option<Instant>,
-    quit: bool,
+    /// `r` was pressed during an upload: restart once it's finished.
+    restart_pending: bool,
+    exit: Option<Exit>,
 }
 
 /// How long the start-up splash stays up.
@@ -68,12 +82,18 @@ const SPLASH_FOR: Duration = Duration::from_millis(1500);
 const CREST_MIN_ROWS: u16 = 40;
 
 /// Runs the dashboard until the officer quits. Always puts the terminal back.
-pub fn run(config: Config, status: Arc<Mutex<Status>>, tx: Sender<Command>) -> io::Result<()> {
+pub fn run(
+    config: Config,
+    status: Arc<Mutex<Status>>,
+    tx: Sender<Command>,
+    check_updates: Sender<()>,
+) -> io::Result<Exit> {
     let mut terminal = ratatui::init(); // Also restores the terminal if we panic.
     let _ = execute!(io::stdout(), EnableBracketedPaste, SetTitle("Murloc Defence League"));
 
     let mut ui = Ui {
         tx: tx.clone(),
+        check_updates,
         token: config.token,
         game_dir: config.game_dir,
         mode: Mode::Normal,
@@ -82,21 +102,26 @@ pub fn run(config: Config, status: Arc<Mutex<Status>>, tx: Sender<Command>) -> i
         notice: None,
         log_path: eventlog::log_path(),
         splash_until: Some(Instant::now() + SPLASH_FOR),
-        quit: false,
+        restart_pending: false,
+        exit: None,
     };
     let result = ui.event_loop(&mut terminal, &status);
 
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     let _ = tx.send(Command::Quit);
-    result
+    result.map(|()| ui.exit.unwrap_or(Exit::Quit))
 }
 
 impl Ui {
     fn event_loop(&mut self, terminal: &mut DefaultTerminal, status: &Arc<Mutex<Status>>) -> io::Result<()> {
-        while !self.quit {
+        while self.exit.is_none() {
             // Take a copy so the worker isn't kept waiting on the lock while we draw.
             let snapshot = status.lock().map(|s| s.clone()).unwrap_or_default();
+            if self.restart_pending && snapshot.phase != Phase::Uploading {
+                self.exit = Some(Exit::Restart);
+                break;
+            }
             if self.splash_until.is_some_and(|t| Instant::now() >= t) {
                 self.splash_until = None;
             }
@@ -133,7 +158,7 @@ impl Ui {
 
     fn on_key(&mut self, key: KeyEvent, status: &Status) {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.quit = true;
+            self.exit = Some(Exit::Quit);
             return;
         }
         match self.mode {
@@ -144,7 +169,26 @@ impl Ui {
 
     fn on_normal_key(&mut self, code: KeyCode, status: &Status) {
         match code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => self.exit = Some(Exit::Quit),
+            KeyCode::Char('c') => match &status.update {
+                Some(u) if u.stage == Stage::Downloading => self.note("Already downloading an update."),
+                _ => {
+                    let _ = self.check_updates.send(());
+                    self.note("Checking GitHub for a newer version of the app…");
+                }
+            },
+            KeyCode::Char('r') => match &status.update {
+                Some(u) if u.stage == Stage::Ready => {
+                    if status.phase == Phase::Uploading {
+                        self.note("Restarting as soon as this upload finishes…");
+                        self.restart_pending = true;
+                    } else {
+                        self.exit = Some(Exit::Restart);
+                    }
+                }
+                Some(u) if u.stage == Stage::Downloading => self.note("The update is still downloading."),
+                _ => self.note("No update is waiting to be installed."),
+            },
             KeyCode::Char('u') => {
                 let _ = self.tx.send(Command::UploadNow);
                 self.note("Checking the game's files now…");
@@ -335,10 +379,16 @@ fn draw_header(frame: &mut Frame, area: Rect, s: &Status, with_crest: bool) {
     let block = panel(concat!("Murloc Defence League · officer utils ", env!("CARGO_PKG_VERSION")))
         .title_top(Line::from(Span::styled(format!(" {badge} "), Style::new().fg(Color::Black).bg(colour).bold())).right_aligned());
     let block = match &s.update {
-        Some(u) => block.title_top(
-            Line::from(Span::styled(format!(" v{} available ", u.version), Style::new().fg(Color::Black).bg(GOLD).bold()))
-                .right_aligned(),
-        ),
+        Some(u) => {
+            let text = match u.stage {
+                Stage::Manual => format!("v{} available", u.version),
+                Stage::Downloading => format!("downloading v{}…", u.version),
+                Stage::Ready => format!("v{} ready: press r to restart", u.version),
+            };
+            block.title_top(
+                Line::from(Span::styled(format!(" {text} "), Style::new().fg(Color::Black).bg(GOLD).bold())).right_aligned(),
+            )
+        }
         None => block,
     };
 
@@ -703,12 +753,26 @@ fn draw_footer(frame: &mut Frame, area: Rect, s: &Status, ui: &Ui) {
             Span::raw(" folder  "),
             key("d"),
             Span::raw(" detect  "),
+            key("c"),
+            Span::raw(" check for updates  "),
             key("q"),
             Span::raw(" quit"),
         ];
-        if let Some(u) = &s.update {
-            spans.push(Span::styled(format!("   v{} is out: {}", u.version, u.url), Style::new().fg(GOLD)));
-        } else if let Some(p) = &ui.log_path {
+        match &s.update {
+            Some(u) if u.stage == Stage::Ready => {
+                spans.push(Span::raw("  "));
+                spans.push(key("r"));
+                spans.push(Span::styled(format!(" restart into v{}", u.version), Style::new().fg(GOLD)));
+            }
+            // Only a manual download needs the address.
+            Some(u) if u.stage == Stage::Manual => {
+                spans.push(Span::styled(format!("   v{} is out: {}", u.version, u.url), Style::new().fg(GOLD)));
+            }
+            _ => {}
+        }
+        if s.update.as_ref().is_none_or(|u| u.stage != Stage::Manual)
+            && let Some(p) = &ui.log_path
+        {
             spans.push(Span::styled(format!("   log: {}", p.display()), LABEL));
         }
         Line::from(spans)
@@ -759,6 +823,7 @@ mod tests {
     fn ui(mode: Mode, input: &str) -> Ui {
         Ui {
             tx: std::sync::mpsc::channel().0,
+            check_updates: std::sync::mpsc::channel().0,
             token: String::new(),
             game_dir: None,
             mode,
@@ -767,7 +832,8 @@ mod tests {
             notice: None,
             log_path: None,
             splash_until: None,
-            quit: false,
+            restart_pending: false,
+            exit: None,
         }
     }
 
@@ -892,6 +958,7 @@ mod tests {
         s.update = Some(crate::update::UpdateInfo {
             version: crate::version::Version::parse("0.2.0").unwrap(),
             url: "https://github.com/ianleckey/mdl-officer-utils/releases/tag/v0.2.0".into(),
+            stage: Stage::Ready,
         });
         s.addon = Some(AddonView {
             installed: crate::version::Version::parse("1.2.0"),
@@ -969,6 +1036,63 @@ mod tests {
         s.website.reachable = Some(false);
         let text = screen_sized(&s, &ui(Mode::Normal, ""), 160, 45);
         assert!(text.contains("no answer for"), "{text}");
+    }
+
+    fn with_update(stage: Stage) -> Status {
+        let mut s = sample();
+        s.update = Some(crate::update::UpdateInfo {
+            version: crate::version::Version::parse("0.3.0").unwrap(),
+            url: "https://x/releases/tag/v0.3.0".into(),
+            stage,
+        });
+        s
+    }
+
+    #[test]
+    fn r_restarts_into_an_installed_update() {
+        let mut u = ui(Mode::Normal, "");
+        u.on_normal_key(KeyCode::Char('r'), &with_update(Stage::Ready));
+        assert_eq!(u.exit, Some(Exit::Restart));
+    }
+
+    #[test]
+    fn r_waits_for_an_upload_to_finish() {
+        let mut status = with_update(Stage::Ready);
+        status.phase = Phase::Uploading;
+        let mut u = ui(Mode::Normal, "");
+        u.on_normal_key(KeyCode::Char('r'), &status);
+        assert_eq!(u.exit, None);
+        assert!(u.restart_pending);
+    }
+
+    #[test]
+    fn r_does_nothing_without_an_installed_update() {
+        for status in [sample(), with_update(Stage::Downloading), with_update(Stage::Manual)] {
+            let mut u = ui(Mode::Normal, "");
+            u.on_normal_key(KeyCode::Char('r'), &status);
+            assert_eq!(u.exit, None);
+            assert!(!u.restart_pending);
+        }
+    }
+
+    #[test]
+    fn update_badge_says_what_to_do() {
+        let text = screen_sized(&with_update(Stage::Ready), &ui(Mode::Normal, ""), 160, 45);
+        assert!(text.contains("v0.3.0 ready: press r to restart"), "{text}");
+        let text = screen_sized(&with_update(Stage::Manual), &ui(Mode::Normal, ""), 160, 45);
+        assert!(text.contains("v0.3.0 available") && text.contains("https://x/releases/tag/v0.3.0"), "{text}");
+    }
+
+    #[test]
+    fn c_asks_for_an_update_check() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut u = ui(Mode::Normal, "");
+        u.check_updates = tx;
+        u.on_normal_key(KeyCode::Char('c'), &sample());
+        assert!(rx.try_recv().is_ok());
+        // Not while an update is downloading.
+        u.on_normal_key(KeyCode::Char('c'), &with_update(Stage::Downloading));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

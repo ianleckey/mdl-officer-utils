@@ -1035,10 +1035,10 @@ fn host_of(api_base: &str) -> String {
     }
 }
 
-/// SHA-256 of the text, as 64 lowercase hex characters.
-fn sha256_hex(text: &str) -> String {
+/// SHA-256 of some bytes (or text), as 64 lowercase hex characters.
+pub fn sha256_hex(data: impl AsRef<[u8]>) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(data.as_ref()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

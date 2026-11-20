@@ -19,8 +19,8 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-        # Tags with a hyphen (v0.2.0-alpha.1, v0.2.0-rc.1) become pre-releases, which
-        # GitHub leaves out of "latest", so the app's update check ignores them.
+        # Tags with a hyphen (v0.2.0-alpha.1, v0.2.0-rc.1) become pre-releases. The
+        # app's updater follows those too (it reads the whole release list).
         run: |
           flags=""
           case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
@@ -55,15 +55,21 @@ jobs:
       - name: Check it runs
         shell: bash
         run: ./${{ matrix.asset }} --version
+      # The app's updater checks its download against this before installing it.
+      - name: Checksum
+        shell: bash
+        run: sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256" && cat "${{ matrix.asset }}.sha256"
       - name: Attach to the release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" "${{ matrix.asset }}" --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release upload "$GITHUB_REF_NAME" "${{ matrix.asset }}" "${{ matrix.asset }}.sha256" --repo "$GITHUB_REPOSITORY" --clobber
       - name: Keep as an artifact (manual runs)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: actions/upload-artifact@v4.4.3
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256

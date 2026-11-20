@@ -18,6 +18,7 @@ mod worker;
 use std::fs::{File, OpenOptions};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 const HELP: &str = "\
 mdl-desktop: the Murloc Defence League officers' desktop app.
@@ -29,8 +30,11 @@ Options:
   --help      print this and exit";
 
 fn main() -> ExitCode {
+    let mut after_update = false;
     match std::env::args().nth(1).as_deref() {
         None => {}
+        // Started by the old version after it installed this one (see update.rs).
+        Some(update::AFTER_UPDATE) => after_update = true,
         Some("--version" | "-V") => {
             println!("mdl-desktop {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
@@ -48,7 +52,11 @@ fn main() -> ExitCode {
     // One copy at a time: two would both upload, and (phase 2) both write Data.lua.
     // The lock goes when this handle is dropped at the end of main, or by the OS
     // if the app crashes, so it can never get stuck.
-    let _lock = match take_lock() {
+    // Where this copy's file is, for restarting into an update. Read it now: on
+    // Linux, once the file has been replaced, the running copy's path reads as "(deleted)".
+    let exe = std::env::current_exe();
+
+    let _lock = match take_lock(after_update) {
         Ok(lock) => lock,
         Err(LockError::Taken) => {
             eprintln!("The MDL desktop app is already running in another window.");
@@ -85,9 +93,19 @@ fn main() -> ExitCode {
     };
 
     worker::spawn(config.clone(), status.clone(), rx);
-    update::spawn(status.clone());
-    match tui::run(config, status, tx) {
-        Ok(()) => ExitCode::SUCCESS,
+    let check_updates = update::spawn(status.clone());
+    match tui::run(config, status, tx, check_updates) {
+        Ok(tui::Exit::Quit) => ExitCode::SUCCESS,
+        Ok(tui::Exit::Restart) => {
+            drop(_lock); // Let the new version take it.
+            match exe {
+                Ok(exe) => update::restart(&exe),
+                Err(e) => {
+                    eprintln!("Couldn't find the app's own file to restart ({e}). Start it again by hand.");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Err(e) => {
             eprintln!("The dashboard stopped: {e}");
             ExitCode::FAILURE
@@ -102,7 +120,20 @@ enum LockError {
 
 /// Locks `mdl-desktop.lock` in the app's config folder. `Ok(None)` if there's no
 /// config folder at all (nothing to lock against).
-fn take_lock() -> Result<Option<File>, LockError> {
+///
+/// Right after an update the old version may still be closing, so `after_update`
+/// keeps trying for a few seconds before giving up.
+fn take_lock(after_update: bool) -> Result<Option<File>, LockError> {
+    let give_up = Instant::now() + Duration::from_secs(if after_update { 10 } else { 0 });
+    loop {
+        match try_lock() {
+            Err(LockError::Taken) if Instant::now() < give_up => std::thread::sleep(Duration::from_millis(200)),
+            other => return other,
+        }
+    }
+}
+
+fn try_lock() -> Result<Option<File>, LockError> {
     let Ok(dir) = config::Config::dir() else { return Ok(None) };
     std::fs::create_dir_all(&dir).map_err(LockError::Io)?;
     let file = OpenOptions::new()
