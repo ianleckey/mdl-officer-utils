@@ -17,6 +17,8 @@ jobs:
         run: cargo clippy --locked
       # The skeleton modules' tests are meant to fail until each step is written
       # (see GUIDE.md). Drop each --skip as you finish that step.
+      # Skips match any part of a test's name, so "addon::" also skips
+      # "data_addon::" tests: remove both once steps 7 and 13 are done.
       - name: Test
         run: >
           cargo test --locked --
