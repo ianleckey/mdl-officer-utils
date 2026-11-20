@@ -43,7 +43,9 @@ Only officers need this. Everyone else just needs the addon.
    - **Windows:** double-click it. It opens in a console window. The `.exe` isn't code-signed, so Windows SmartScreen may say *"Windows protected your PC"*. Click **More info → Run anyway**.
    - **Linux:** run it from a terminal.
 
-The app tells you when a newer version is out (a gold badge at the top). It never updates itself.
+**Updates install themselves.** Once a day (or when you press `c`) the app checks GitHub for a newer version (test versions included), downloads it, checks it isn't corrupted, and puts it in place. A gold **ready: press r to restart** badge appears; press `r` to switch over (it waits for any upload in progress), or just carry on and the new version starts next time. If it can't update itself (say the folder it lives in is read-only), the badge links to the download instead.
+
+The first version that can do this is 0.2.0-alpha.2. Anyone on an older copy needs to download a new one by hand, once.
 
 ## First run
 
@@ -65,6 +67,8 @@ Leave the app running while you play. Closing it just means figures wait until y
 | `f` | Set the game folder by typing it |
 | `d` | Find the game folder automatically |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | Scroll the events |
+| `c` | Check for a newer version of the app now (instead of waiting for the daily check) |
+| `r` | Restart into an update that's been installed |
 | `q` / `Ctrl-C` | Quit |
 
 ## What it touches
@@ -112,7 +116,7 @@ The result is `target/x86_64-pc-windows-gnu/release/mdl-desktop.exe`. To try it 
    ```
 3. A few minutes later the Releases page has `mdl-desktop-linux-x86_64` and `mdl-desktop-windows-x86_64.exe`. Tags with a hyphen (`v0.2.0-alpha.1`) become pre-releases.
 
-Running copies of older versions check GitHub once a day and show a gold **v0.2.0 available** badge. To try a release build without releasing, run the *Release* workflow by hand from the Actions tab: the binaries are attached to the run.
+Each binary gets a `.sha256` file next to it; running copies (0.2.0-alpha.2 and later) check GitHub once a day, download the newest release for their platform, check it against that file, and install it. Pre-releases count, so every officer's copy picks up an alpha. To try a release build without releasing, run the *Release* workflow by hand from the Actions tab: the binaries are attached to the run.
 
 ## Developing
 
