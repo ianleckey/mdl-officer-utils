@@ -1,11 +1,17 @@
-//! Talking to the website. See GUIDE.md, step 3.
+//! Talking to the website.
 //!
 //! Base URL: `Config::api_base` (normally https://murlocdefenseleague.org/api/v1).
 //! JSON in and out. Every request sends `Authorization: Bearer <token>`.
 
-use std::time::Duration;
-use reqwest::blocking::Response;
+use std::cell::Cell;
+use std::time::{Duration, Instant, SystemTime};
+
+use reqwest::StatusCode;
+use reqwest::blocking::{RequestBuilder, Response};
+use reqwest::header;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::json;
 
 use crate::addon::AddonInfo;
 use crate::lfg::{LfgSnapshot, SignupResult};
@@ -39,7 +45,6 @@ pub struct ImportResult {
 }
 
 /// What `GET /lfg` can come back with.
-#[allow(dead_code)] // Phase 2 skeleton: remove once step 10 uses it.
 #[derive(Debug, Clone)]
 pub enum LfgFetch {
     /// 304: nothing has changed since the ETag we sent.
@@ -49,7 +54,6 @@ pub enum LfgFetch {
 }
 
 /// The body of a 200 from `POST /lfg/signups`.
-#[allow(dead_code)] // Phase 2 skeleton: remove once step 10 uses it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SignupResults {
     pub results: Vec<SignupResult>,
@@ -87,10 +91,22 @@ impl std::fmt::Display for ApiError {
     }
 }
 
+/// The outcome of the latest request, for the dashboard's website health line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Contact {
+    pub at: SystemTime,
+    /// How long the request took (until the response headers, or the failure).
+    pub took: Duration,
+    /// True if the website gave a proper HTTP answer. False if it couldn't be
+    /// reached at all, timed out, or answered with a 5xx.
+    pub answered: bool,
+}
+
 pub struct Client {
     http: reqwest::blocking::Client,
     base: String,
     token: String,
+    last_contact: Cell<Option<Contact>>,
 }
 
 impl Client {
@@ -104,12 +120,28 @@ impl Client {
             http,
             base: base.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            last_contact: Cell::new(None),
         }
     }
 
+    /// How the latest request went, if there's been one.
+    pub fn last_contact(&self) -> Option<Contact> {
+        self.last_contact.get()
+    }
+
+    /// Sends a request with the token, noting how it went in `last_contact`.
+    /// A network failure becomes `Transient`; any HTTP answer is returned as is.
+    fn execute(&self, req: RequestBuilder) -> Result<Response, ApiError> {
+        let started = Instant::now();
+        let result = req.bearer_auth(&self.token).send();
+        let answered = result.as_ref().is_ok_and(|res| !res.status().is_server_error());
+        self.last_contact.set(Some(Contact { at: SystemTime::now(), took: started.elapsed(), answered }));
+        result.map_err(|e| ApiError::Transient(e.to_string()))
+    }
+
+    /// Turns a response that wasn't the expected success into the matching `ApiError`.
     fn error_from(response: Response) -> ApiError {
-        let status = response.status().as_u16();
-        match status {
+        match response.status().as_u16() {
             401 => ApiError::Unauthorized,
             403 => ApiError::NotOfficer,
             422 => match response.json::<ErrorBody>() {
@@ -119,13 +151,14 @@ impl Client {
             429 => {
                 let secs = response
                     .headers()
-                    .get(reqwest::header::RETRY_AFTER)     
-                    .and_then(|v| v.to_str().ok())         
-                    .and_then(|s| s.parse::<u64>().ok())   
-                    .unwrap_or(60);                        
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(60);
                 ApiError::RateLimited(Duration::from_secs(secs))
             }
             404 => ApiError::NotAvailable,
+            // 5xx, and anything else unexpected (a 3xx we didn't ask for, say).
             other => ApiError::Transient(format!("the website answered {other}")),
         }
     }
@@ -135,46 +168,35 @@ impl Client {
         format!("{}{}", self.base, path)
     }
 
+    /// Sends a request (see `execute`), and reads a 200's JSON body as `T`.
+    /// Anything else becomes the matching `ApiError` (see `error_from`).
+    fn send<T: DeserializeOwned>(&self, req: RequestBuilder) -> Result<T, ApiError> {
+        let res = self.execute(req)?;
+        if res.status() != StatusCode::OK {
+            return Err(Self::error_from(res));
+        }
+        res.json::<T>().map_err(|e| ApiError::Transient(e.to_string()))
+    }
+
     /// `GET /me`: checks the token.
     pub fn me(&self) -> Result<Me, ApiError> {
-        let res = self.http.get(self.url("/me"))
-                    .bearer_auth(&self.token)
-                    .send()
-                    .map_err(|e| ApiError::Transient(e.to_string()))?;
-        if res.status().as_u16() == 200 {
-            res.json::<Me>().map_err(|e| ApiError::Transient(e.to_string()))
-        } else {
-            Err(Self::error_from(res))
-        }
+        self.send(self.http.get(self.url("/me")))
     }
 
     /// `POST /murlocs` with `{"export": export}`, the text passed on exactly as read.
     pub fn post_murlocs(&self, export: &str) -> Result<ImportResult, ApiError> {
-        let value = serde_json::json!({ "export": export }); 
-        let res = self.http.post(self.url("/murlocs"))
-                    .bearer_auth(&self.token)
-                    .json(&value)
-                    .send()
-                    .map_err(|e| ApiError::Transient(e.to_string()))?;
-
-        if res.status().as_u16() == 200 {
-            res.json::<ImportResult>().map_err(|e| ApiError::Transient(e.to_string()))
-        } else {
-            Err(Self::error_from(res))
-        }
+        self.send(self.http.post(self.url("/murlocs")).json(&json!({ "export": export })))
     }
 
-    /// `GET /addon`: the latest guild addon version (GUIDE.md step 13). The
-    /// website doesn't have this endpoint yet; `addon.rs` has the proposed shape.
-    ///
-    /// Yours. It's called on every start-up, so until it's written it answers
-    /// `NotAvailable`, exactly what the real site's 404 will give today.
+    /// `GET /addon`: the latest guild addon version. The website doesn't have
+    /// this endpoint yet (its 404 becomes `NotAvailable`); `addon.rs` has the
+    /// proposed shape.
     pub fn addon_info(&self) -> Result<AddonInfo, ApiError> {
-        Err(ApiError::NotAvailable)
+        self.send(self.http.get(self.url("/addon")))
     }
 
     // -----------------------------------------------------------------------
-    // Phase 2: the group finder. GUIDE.md step 9.
+    // Phase 2: the group finder.
     // -----------------------------------------------------------------------
 
     /// `GET /lfg`, sending `If-None-Match: <etag>` when we have one.
@@ -182,18 +204,64 @@ impl Client {
     /// * 304 → `Ok(LfgFetch::NotModified)` (no body)
     /// * 200 → `Ok(LfgFetch::Fresh { snapshot, etag })`, with `etag` from the response's
     ///   `ETag` header (`None` if the site didn't send one)
-    /// * anything else → `Err(Self::error_from(res))`, as in `me()`
-    #[allow(dead_code)] // Phase 2 skeleton: remove once step 10 uses it.
+    /// * anything else → the matching `ApiError`
     pub fn get_lfg(&self, etag: Option<&str>) -> Result<LfgFetch, ApiError> {
-        let _ = etag;
-        todo!("step 9 in GUIDE.md")
+        let mut req = self.http.get(self.url("/lfg"));
+        if let Some(tag) = etag {
+            req = req.header(header::IF_NONE_MATCH, tag);
+        }
+        let res = self.execute(req)?;
+        match res.status() {
+            StatusCode::NOT_MODIFIED => Ok(LfgFetch::NotModified),
+            StatusCode::OK => {
+                // Read the header first: `.json()` consumes the response.
+                let etag = res.headers().get(header::ETAG).and_then(|v| v.to_str().ok()).map(String::from);
+                let snapshot = res.json::<LfgSnapshot>().map_err(|e| ApiError::Transient(e.to_string()))?;
+                Ok(LfgFetch::Fresh { snapshot, etag })
+            }
+            _ => Err(Self::error_from(res)),
+        }
     }
 
     /// `POST /lfg/signups` with `{"signups": [...]}`, the outbox items passed on
     /// unchanged. 200 → the `results` list, one per item.
-    #[allow(dead_code)] // Phase 2 skeleton: remove once step 10 uses it.
     pub fn post_signups(&self, signups: &[serde_json::Value]) -> Result<Vec<SignupResult>, ApiError> {
-        let _ = signups;
-        todo!("step 9 in GUIDE.md")
+        let req = self.http.post(self.url("/lfg/signups")).json(&json!({ "signups": signups }));
+        self.send::<SignupResults>(req).map(|r| r.results)
+    }
+}
+
+/// Against `tools/mock_site.py`: start it first, then
+/// `cargo test api::mock -- --ignored`.
+#[cfg(test)]
+mod mock {
+    use super::*;
+
+    fn client() -> Client {
+        Client::new("http://127.0.0.1:8787/api/v1", "test")
+    }
+
+    #[test]
+    #[ignore = "needs tools/mock_site.py running"]
+    fn every_endpoint() {
+        let c = client();
+        assert!(c.me().unwrap().officer);
+        assert_eq!(c.addon_info().unwrap().min_for_murlocs.as_deref(), Some("1.3.0"));
+        let result = c.post_murlocs("MDLMURLOCS;1;1795219200;Mock\nW;1794369600;Shoop Dahoop;3").unwrap();
+        assert_eq!(result.exported_at, 1795219200);
+
+        let LfgFetch::Fresh { snapshot, etag } = c.get_lfg(None).unwrap() else { panic!("expected a 200") };
+        assert!(!snapshot.runs.is_empty());
+        let etag = etag.expect("the mock sends an ETag");
+        assert!(matches!(c.get_lfg(Some(&etag)).unwrap(), LfgFetch::NotModified));
+        assert!(c.last_contact().unwrap().answered, "a 304 is an answer");
+
+        // A 5xx counts as no answer, for the dashboard's health line.
+        let mock = |path: &str| c.http.post(format!("http://127.0.0.1:8787{path}")).send().unwrap();
+        mock("/mock/down");
+        assert!(matches!(c.me(), Err(ApiError::Transient(_))));
+        assert!(!c.last_contact().unwrap().answered);
+        mock("/mock/up");
+        assert!(c.me().is_ok() && c.last_contact().unwrap().answered);
     }
 }

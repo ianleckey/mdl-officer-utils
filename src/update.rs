@@ -43,8 +43,9 @@ pub fn spawn(status: Arc<Mutex<Status>>) {
                 match latest_release() {
                     Ok(newer) => {
                         if let Ok(mut s) = status.lock() {
-                            if newer.is_some() && s.update != newer {
-                                let u = newer.clone().unwrap();
+                            if let Some(u) = &newer
+                                && s.update.as_ref() != Some(u)
+                            {
                                 s.push_event(Event::now(
                                     Level::Info,
                                     format!("Version {} of this app is out: {}", u.version, u.url),

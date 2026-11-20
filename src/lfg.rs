@@ -9,14 +9,8 @@
 //! or addon adds later is passed on untouched (the spec: "readers ignore fields
 //! they don't know"). `Run` and `Signup` are typed *views* of them, used only
 //! where the app itself needs a field (the dashboard).
-//!
-//! The types are finished. The four functions at the bottom are GUIDE.md step 8.
 
-// Phase 2 skeleton: quiets "never used" warnings until step 10 wires this in.
-// Delete this line then, and let the compiler point out anything left over.
-#![allow(dead_code)]
-
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,7 +30,6 @@ pub struct LfgSnapshot {
 /// A typed view of one run, for the dashboard. Fields the app doesn't show are left out.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Run {
-    pub id: String,
     /// "dungeon" or "battleground".
     pub kind: String,
     pub title: String,
@@ -63,9 +56,6 @@ impl Run {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Signup {
-    pub character: String,
-    /// "tank", "healer", "melee" or "ranged".
-    pub role: String,
     /// "in", "waiting" or "out".
     pub status: String,
 }
@@ -110,36 +100,35 @@ impl Ack {
 /// (and an unchanged set of acks writes byte-identical text).
 pub type Acks = BTreeMap<String, Ack>;
 
-// ---------------------------------------------------------------------------
-// Yours: GUIDE.md step 8. Tests below.
-// ---------------------------------------------------------------------------
-
-/// Parses the `lfgOutbox` string (already un-escaped by `savedvars::read_key`).
+/// Parses the `lfgOutbox` string (already un-escaped by `SavedVars::get`).
 /// Bad JSON is an `Err` with a message fit for the Events panel.
 pub fn parse_outbox(json: &str) -> Result<Outbox, String> {
-    let _ = json;
-    todo!("step 8 in GUIDE.md")
+    serde_json::from_str(json).map_err(|e| e.to_string())
 }
 
 /// The `client_id` of an outbox item, if it has a string one.
 pub fn client_id(item: &Value) -> Option<&str> {
-    let _ = item;
-    todo!("step 8 in GUIDE.md")
+    item.get("client_id")?.as_str()
 }
 
 /// The outbox items that still need sending: drop any without a `client_id`, any
 /// already in `acks`, and repeats of the same `client_id` (keep the first).
 /// Order is kept.
 pub fn pending(outbox: &Outbox, acks: &Acks) -> Vec<Value> {
-    let _ = (outbox, acks);
-    todo!("step 8 in GUIDE.md")
+    let mut seen = HashSet::new();
+    outbox
+        .signups
+        .iter()
+        // `insert` is false for a client_id already seen: keep only the first.
+        .filter(|item| client_id(item).is_some_and(|id| !acks.contains_key(id) && seen.insert(id)))
+        .cloned()
+        .collect()
 }
 
 /// Removes acks older than 7 days (`ACK_KEEP_SECS`) before `now` (Unix seconds).
 /// Exactly 7 days old is still kept.
 pub fn prune_acks(acks: &mut Acks, now: i64) {
-    let _ = (acks, now);
-    todo!("step 8 in GUIDE.md")
+    acks.retain(|_, ack| now - ack.at <= ACK_KEEP_SECS);
 }
 
 #[cfg(test)]

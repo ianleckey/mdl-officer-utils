@@ -13,18 +13,24 @@ The game's addons can't use the network. Instead, this app watches the files the
 ## What it does
 
 - **Impact Report sync.** When you log out or `/reload`, the game saves the addon's murloc figures. Within 30 seconds the app uploads them to the website, so there's no more pressing *Export for website* and pasting. It only sends an export when it has changed, and it's safe to run alongside other officers: the website keeps the higher counts.
-- **A dashboard in your terminal.** It shows:
-  - who you're signed in as;
-  - every game account it found, and what it last did with each;
-  - your last upload (weeks, people, any names the website couldn't match);
-  - a scrollable event history.
+- **A dashboard in your terminal**, made for a big or maximised window:
+  - **Header:** who you're signed in as, the game folder, the guild addon's version,
+    and the website's health: which site it's talking to, when it last answered and
+    how fast, and how each feature is doing (working, unreachable, busy, or not on
+    the site yet).
+  - **Murloc figures:** every game account and what it last did, your last upload
+    (weeks, people, any names the website couldn't match), and this week's leaderboard.
+  - **Group finder** (when it's switched on), beside the murloc panel on wide
+    terminals: sign-ups relayed and waiting, and as many upcoming runs as fit.
+  - **Events:** a scrollable history across the full width.
 - **Clear reasons when nothing happens.** For example, an account whose addon is too old to send figures is flagged as such, rather than the app sitting there silently.
 - **An event log** in `events.log`, next to the settings, for working out later what happened.
-- **Coming:**
-  - the group finder: runs from the website show in game, and sign-ups go back;
-  - this week's murloc leaderboard;
-  - a countdown to the Wednesday 19:00 Discord post;
-  - an addon version check.
+- **This week's murloc slayers:** the top names from the newest export, and a
+  Wednesday reminder to log in and out before the 19:00 Discord post if the
+  closed week's figures haven't been exported yet.
+- **An addon version check:** the installed guild addon's version in the
+  header, and whether the website has a newer one (once the website publishes it).
+- **Coming:** the group finder: runs from the website show in game, and sign-ups go back.
 
 ## Install
 
@@ -82,7 +88,7 @@ You need [Rust](https://rustup.rs) (stable).
 
 ```sh
 cargo run                 # the dashboard
-cargo test                # tests (some fail on purpose; see below)
+cargo test                # tests
 cargo build --release     # target/release/mdl-desktop
 ```
 
@@ -94,13 +100,39 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-**Releases:** push a `v*` tag (e.g. `v0.2.0`) and GitHub Actions builds the Linux and Windows binaries and attaches them to a release. Tags with a hyphen (`v0.2.0-alpha.1`) become pre-releases. The full steps are in [GUIDE.md](GUIDE.md#releasing).
+The result is `target/x86_64-pc-windows-gnu/release/mdl-desktop.exe`. To try it from WSL, copy it somewhere under `/mnt/c/` and run it there: it behaves like a real Windows program (real `C:\` paths, config in `%APPDATA%`). `mdl-desktop.exe --version` checks a build without opening the dashboard. If the build fails compiling `aws-lc-sys`, check `x86_64-w64-mingw32-gcc --version` works; you may also need `sudo apt install cmake nasm`.
+
+## Releasing
+
+1. Bump `version` in `Cargo.toml` (e.g. `0.2.0`), then run `cargo build` so `Cargo.lock` agrees.
+2. Commit, then tag and push:
+   ```sh
+   git tag v0.2.0
+   git push origin master v0.2.0
+   ```
+3. A few minutes later the Releases page has `mdl-desktop-linux-x86_64` and `mdl-desktop-windows-x86_64.exe`. Tags with a hyphen (`v0.2.0-alpha.1`) become pre-releases.
+
+Running copies of older versions check GitHub once a day and show a gold **v0.2.0 available** badge. To try a release build without releasing, run the *Release* workflow by hand from the Actions tab: the binaries are attached to the run.
 
 ## Developing
 
-This is also a Rust learning project. **[GUIDE.md](GUIDE.md)** walks through the code step by step, with hints, and several modules are deliberately left as skeletons with their tests already written. Those tests fail until each step is done, and CI skips them until then.
+```
+ main thread (dashboard)            worker thread
+ ───────────────────────            ─────────────
+ draws Status     <── Arc<Mutex<Status>> ── writes Status (and events)
+ keys u, t, f, d  ── mpsc::Sender<Command> ──> recv_timeout(...)
+```
 
-- **`tools/mock_site.py`** is a fake website (Python, standard library only) that speaks the API, including endpoints the real site doesn't have yet. Point the app at it with `api_base = "http://127.0.0.1:8787/api/v1"` in `config.toml`.
+The dashboard (`tui.rs`) redraws four times a second and never waits on the network or disk. The worker (`worker.rs`) wakes every 30 seconds, reads each account's SavedVariables file when it changes (`savedvars.rs`, `game.rs`), uploads new exports (`api.rs`), and in phase 2 writes the data addon (`lfg.rs`, `lua.rs`, `data_addon.rs`). It is the only thing that saves `config.toml`. The "This week" panel comes from `report.rs` and `schedule.rs`, the addon check from `addon.rs`, the app update check from `update.rs`.
+
+- **`tools/mock_site.py`** is a fake website (Python, standard library only) that speaks the API, including endpoints the real site doesn't have yet. Its docstring lists switches to simulate a revoked token, the site being down, or no group finder. Point the app at it in `config.toml`:
+  ```toml
+  api_base = "http://127.0.0.1:8787/api/v1"
+  token = "test"
+  lfg_enabled = true   # the group finder; off by default
+  ```
+  `cargo test api::mock -- --ignored` checks every endpoint against it.
 - **`cargo test preview -- --ignored --nocapture`** prints the dashboard with sample data, so you can check a layout change without running the app.
+- CI builds, runs clippy and runs every test on each push.
 
 The contract between the website, this app and the addon is the *LFG desktop sync / desktop app* spec. If they disagree, the spec wins: change it there first, then in code.

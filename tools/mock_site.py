@@ -17,7 +17,7 @@ It speaks the spec's API v1:
   GET  /api/v1/lfg            → runs, with a real ETag; 304 when If-None-Match matches
   POST /api/v1/lfg/signups    → one result per item; idempotent by client_id
   GET  /api/v1/addon          → {"latest": "1.4.0", "min_for_murlocs": "1.3.0", "url": ...}
-                                (proposed endpoint for the addon version check, GUIDE.md step 13)
+                                (proposed endpoint for the addon version check)
 
 Sign-ups are rejected to match the spec's reasons, so each one can be tested:
   run_id "nope"          → unknown_run

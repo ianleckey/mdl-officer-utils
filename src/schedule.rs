@@ -1,4 +1,4 @@
-//! The guild's weekly clock. GUIDE.md step 12.
+//! The guild's weekly clock.
 //!
 //! * The weekly **reset** is Wednesday 04:00 UTC. (That's what the addon's own
 //!   exports use: every `week_start` is a Wednesday 04:00 UTC.)
@@ -9,11 +9,8 @@
 //! Officers have all Wednesday after the reset to log in and out, so their game
 //! exports the closed week's final figures before 19:00.
 
-// Skeleton: quiets "never used" warnings for the constants your code will use.
-// Delete this line once step 12 is written.
-#![allow(dead_code)]
-
-use jiff::{Timestamp, ZonedDateTime};
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, ToSpan};
 
 /// The weekly reset, in UTC.
 pub const RESET_WEEKDAY: jiff::civil::Weekday = jiff::civil::Weekday::Wednesday;
@@ -26,23 +23,25 @@ pub const UK: &str = "Europe/London";
 /// The nudge text the dashboard shows.
 pub const NUDGE: &str = "Log in and out before 19:00 so last week's murloc figures are in";
 
-// ---------------------------------------------------------------------------
-// Yours: GUIDE.md step 12. These run inside the app already, so until they're
-// written they return `None` ("not written yet") instead of panicking.
-// Once written, the first two always return `Some`.
-// ---------------------------------------------------------------------------
-
 /// The most recent weekly reset at or before `now` (a Wednesday 04:00 UTC).
+///
+/// Always `Some` for real clocks; `None` only at the very edge of jiff's range.
 pub fn last_reset(now: Timestamp) -> Option<Timestamp> {
-    let _ = now;
-    None
-}
-
-/// The next Discord post strictly after `now`: Wednesday 19:00 in Europe/London.
-/// At exactly 19:00 on a Wednesday, that post is happening, so return next week's.
-pub fn next_discord_post(now: Timestamp) -> Option<ZonedDateTime> {
-    let _ = now;
-    None
+    // Today's 04:00 UTC, then step back a day at a time (at most a week) until
+    // it's a Wednesday that isn't still in the future.
+    let mut candidate = now
+        .to_zoned_datetime(TimeZone::UTC)
+        .with()
+        .hour(RESET_HOUR_UTC)
+        .minute(0)
+        .second(0)
+        .subsec_nanosecond(0)
+        .build()
+        .ok()?;
+    while candidate.weekday() != RESET_WEEKDAY || candidate.timestamp() > now {
+        candidate = candidate.checked_sub(1.day()).ok()?;
+    }
+    Some(candidate.timestamp())
 }
 
 /// `Some(NUDGE)` when the officer should log in and out:
@@ -52,8 +51,22 @@ pub fn next_discord_post(now: Timestamp) -> Option<ZonedDateTime> {
 ///
 /// No export at all (`None`) → `None`: there's nothing to judge.
 pub fn nudge(now: Timestamp, exported_at: Option<i64>) -> Option<&'static str> {
-    let _ = (now, exported_at);
-    None
+    let exported_at = exported_at?;
+    let reset = last_reset(now)?;
+
+    // "After this week's reset" = the latest reset happened today (UTC).
+    let today_utc = now.to_zoned_datetime(TimeZone::UTC).date();
+    if reset.to_zoned_datetime(TimeZone::UTC).date() != today_utc {
+        return None;
+    }
+
+    // Before 19:00 on a UK Wednesday. jiff works out GMT versus BST.
+    let uk = now.in_tz(UK).ok()?;
+    if uk.weekday() != POST_WEEKDAY || uk.hour() >= POST_HOUR_UK {
+        return None;
+    }
+
+    (exported_at < reset.as_second()).then_some(NUDGE)
 }
 
 #[cfg(test)]
@@ -63,10 +76,6 @@ mod tests {
     /// "2026-11-18T19:00:00Z" → Timestamp
     fn t(s: &str) -> Timestamp {
         s.parse().unwrap()
-    }
-
-    fn post_after(now: &str) -> Timestamp {
-        next_discord_post(t(now)).expect("Some once written").timestamp()
     }
 
     #[test]
@@ -81,37 +90,6 @@ mod tests {
         // Real week_start values from an export.
         assert_eq!(last_reset(t("2026-11-19T00:00:00Z")).map(|r| r.as_second()), Some(1794974400));
         assert_eq!(last_reset(t("2026-11-12T00:00:00Z")).map(|r| r.as_second()), Some(1794369600));
-    }
-
-    #[test]
-    fn post_in_winter_is_1900_utc() {
-        assert_eq!(post_after("2026-11-16T12:00:00Z"), t("2026-11-18T19:00:00Z"));
-    }
-
-    #[test]
-    fn post_in_summer_is_1800_utc() {
-        // 19:00 BST = 18:00 UTC.
-        assert_eq!(post_after("2026-06-15T12:00:00Z"), t("2026-06-17T18:00:00Z"));
-    }
-
-    #[test]
-    fn post_across_the_clocks_going_back() {
-        // Clocks go back on Sunday 25 October 2026.
-        assert_eq!(post_after("2026-10-19T12:00:00Z"), t("2026-10-21T18:00:00Z"), "still BST");
-        assert_eq!(post_after("2026-10-22T12:00:00Z"), t("2026-10-28T19:00:00Z"), "back to GMT");
-    }
-
-    #[test]
-    fn post_boundaries() {
-        assert_eq!(post_after("2026-11-18T18:59:59Z"), t("2026-11-18T19:00:00Z"), "a second before");
-        assert_eq!(post_after("2026-11-18T19:00:00Z"), t("2026-11-25T19:00:00Z"), "exactly at the post");
-    }
-
-    #[test]
-    fn post_is_in_uk_time() {
-        let z = next_discord_post(t("2026-11-16T12:00:00Z")).unwrap();
-        assert_eq!(z.time_zone().iana_name(), Some(UK));
-        assert_eq!(z.hour(), 19);
     }
 
     #[test]

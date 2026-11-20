@@ -1,4 +1,4 @@
-//! "Is the installed guild addon up to date?" GUIDE.md step 13.
+//! "Is the installed guild addon up to date?"
 //!
 //! Two sources:
 //! * The installed version: `## Version:` in the main addon's .toc
@@ -49,11 +49,18 @@ pub struct AddonView {
 /// * No `installed` version → nothing can be "out of date": both flags off.
 /// * No `info` (the website doesn't publish versions yet) → just `installed`.
 /// * Versions that don't parse count as unknown (`None`).
-///
-/// Yours (step 13). Until then it only passes `installed` through.
 pub fn addon_status(installed: Option<Version>, info: Option<&AddonInfo>) -> AddonView {
-    let _ = info;
-    AddonView { installed, ..AddonView::default() }
+    let latest = info.and_then(|i| Version::parse(&i.latest));
+    let min_for_murlocs = info.and_then(|i| i.min_for_murlocs.as_deref()).and_then(Version::parse);
+    // Is `v` newer than what's installed? Never, when nothing is installed.
+    let ahead_of_installed = |v: &Version| installed.is_some_and(|i| v.is_newer_than(&i));
+    AddonView {
+        installed,
+        latest,
+        update_available: latest.as_ref().is_some_and(ahead_of_installed),
+        too_old_for_murlocs: min_for_murlocs.filter(ahead_of_installed),
+        url: info.and_then(|i| i.url.clone()),
+    }
 }
 
 #[cfg(test)]

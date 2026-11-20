@@ -1,5 +1,4 @@
 //! The tiny data addon the app owns: `Interface/AddOns/MurlocDefenceLeague_Data/`.
-//! GUIDE.md step 7.
 //!
 //! It holds two files:
 //! * `MurlocDefenceLeague_Data.toc`: fixed text, except the `## Interface:` number,
@@ -15,13 +14,13 @@
 //!
 //! This is the only place the app writes into the game folder.
 
-// Phase 2 skeleton: quiets "never used" warnings until step 10 wires this in.
-// Delete this line then, and let the compiler point out anything left over.
-#![allow(dead_code)]
-
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use mlua::{LuaSerdeExt, Table};
+
+use crate::game;
 use crate::lfg::{Acks, LfgSnapshot};
 
 pub const FOLDER: &str = "MurlocDefenceLeague_Data";
@@ -43,11 +42,6 @@ pub fn toc_path(game_dir: &Path) -> PathBuf {
     folder(game_dir).join(format!("{FOLDER}.toc"))
 }
 
-/// `<game>/Interface/AddOns/MurlocDefenceLeague/MurlocDefenceLeague.toc`, the main addon's.
-pub fn main_toc_path(game_dir: &Path) -> PathBuf {
-    game_dir.join("Interface").join("AddOns").join("MurlocDefenceLeague").join("MurlocDefenceLeague.toc")
-}
-
 /// The data addon's .toc, word for word from the spec.
 pub fn render_toc(interface: &str) -> String {
     format!(
@@ -58,15 +52,10 @@ pub fn render_toc(interface: &str) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Yours: GUIDE.md step 7. Tests below.
-// ---------------------------------------------------------------------------
-
 /// The number after `## Interface:` in the main addon's .toc (e.g. "16001"),
 /// or `None` if the file or the line is missing.
 pub fn interface_version(game_dir: &Path) -> Option<String> {
-    let _ = game_dir;
-    todo!("step 7 in GUIDE.md")
+    game::main_toc_field(game_dir, "Interface")
 }
 
 /// The whole text of Data.lua:
@@ -83,30 +72,60 @@ pub fn interface_version(game_dir: &Path) -> Option<String> {
 /// With no snapshot yet (the website hasn't answered), write `runs = {}` and
 /// `generated_at = 0`, so the addon can still read the acks.
 pub fn render_data(snapshot: Option<&LfgSnapshot>, acks: &Acks) -> String {
-    let _ = (snapshot, acks);
-    todo!("step 7 in GUIDE.md")
+    // Both are plain data with string keys, so turning them into JSON can't fail.
+    let mut data = match snapshot {
+        Some(s) => serde_json::to_value(s).expect("a snapshot is always valid JSON"),
+        None => serde_json::json!({ "version": 1, "generated_at": 0, "runs": [] }),
+    };
+    data["acks"] = serde_json::to_value(acks).expect("acks are always valid JSON");
+    format!("MurlocDefenceLeagueData = {}\n", crate::lua::to_lua(&data))
 }
 
 /// Writes `text` to `path` atomically, creating the folder if needed, but only if
 /// the file doesn't already hold exactly that text. Returns whether it wrote.
 pub fn write_if_changed(path: &Path, text: &str) -> io::Result<bool> {
-    let _ = (path, text);
-    todo!("step 7 in GUIDE.md")
+    if fs::read_to_string(path).ok().as_deref() == Some(text) {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    // Write beside it, then rename over it, so the game never reads half a file.
+    let tmp = path.with_extension("lua.tmp");
+    fs::write(&tmp, text)?;
+    fs::rename(&tmp, path)?;
+    Ok(true)
 }
 
 /// Reads the acks back out of our own Data.lua (they live there, not in config).
 /// A missing file gives empty acks. A file that won't parse is an `Err`.
 pub fn read_acks(game_dir: &Path) -> Result<Acks, String> {
-    let _ = game_dir;
-    todo!("step 7 in GUIDE.md")
+    let text = match fs::read_to_string(data_path(game_dir)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Acks::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+
+    let lua = crate::lua::exec(&text)?;
+    let acks = lua
+        .globals()
+        .get::<Table>("MurlocDefenceLeagueData")
+        .and_then(|data| data.get::<Table>("acks"))
+        .map_err(|e| e.to_string())?;
+
+    // An empty `{}` reads back as an empty *list*, which won't become a map.
+    if acks.pairs::<mlua::Value, mlua::Value>().next().is_none() {
+        return Ok(Acks::new());
+    }
+    lua.from_value(mlua::Value::Table(acks)).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::main_toc_path;
     use crate::lfg::Ack;
     use serde_json::json;
-    use std::fs;
 
     fn game() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()

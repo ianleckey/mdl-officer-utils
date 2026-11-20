@@ -3,8 +3,6 @@
 //!   Windows: %APPDATA%\MurlocDefenceLeague\mdl-desktop\config\config.toml
 //!
 //! The spec says this must never live in the game folder.
-//!
-//! This file is finished boilerplate; you shouldn't need to change it for phase 1.
 
 use std::collections::BTreeMap;
 use std::fs;
