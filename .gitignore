@@ -1,0 +1,4 @@
+/target
+# Never commit an officer's settings or logs (they live outside the repo anyway).
+/config.toml
+*.log

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - name: Build
+        run: cargo build --locked
+      - name: Clippy
+        run: cargo clippy --locked
+      # The skeleton modules' tests are meant to fail until each step is written
+      # (see GUIDE.md). Drop each --skip as you finish that step.
+      - name: Test
+        run: >
+          cargo test --locked --
+          --skip lua::
+          --skip data_addon::
+          --skip lfg::
+          --skip report::
+          --skip schedule::
+          --skip addon::

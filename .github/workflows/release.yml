@@ -1,0 +1,64 @@
+name: Release
+
+# Push a tag like v0.2.0 to build the Linux and Windows binaries and attach them
+# to a GitHub Release. "Run workflow" on the Actions tab builds them without
+# releasing (the binaries appear as downloadable artifacts on that run).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  create:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+
+  build:
+    needs: create
+    # Still build when `create` was skipped (a manual run, not a tag).
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: mdl-desktop
+            asset: mdl-desktop-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: mdl-desktop.exe
+            asset: mdl-desktop-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Name the binary
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+      - name: Check it runs
+        shell: bash
+        run: ./${{ matrix.asset }} --version
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "${{ matrix.asset }}" --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Keep as an artifact (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
