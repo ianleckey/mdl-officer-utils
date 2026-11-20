@@ -1,5 +1,5 @@
 //! Version numbers like "1.4.0" or "v0.2.0", and comparing them.
-//! Used by the app's update check and by the addon version check (step 13).
+//! Used by the app's update check and by the addon version check.
 
 use std::cmp::Ordering;
 use std::fmt;

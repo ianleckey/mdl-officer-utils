@@ -1,4 +1,5 @@
-//! Turning JSON into Lua source text, for Data.lua. GUIDE.md step 6.
+//! Lua in both directions: turning JSON into Lua source for Data.lua, and
+//! running Lua files the game reads or writes (`exec`) to look inside them.
 //!
 //! The spec's rules for strings:
 //! * Lua double-quoted strings.
@@ -17,14 +18,19 @@
 //!   safely in Lua; write `nil` there and accept it.)
 //! * Numbers as they are, `true`/`false` as they are.
 //!
-//! Layout (line breaks, indentation) is up to you; the tests don't check it,
-//! only that Lua reads back the same data.
+//! Everything is written on one line; only what Lua reads back matters.
 
-// Phase 2 skeleton: quiets "never used" warnings until step 10 wires this in.
-// Delete this line then, and let the compiler point out anything left over.
-#![allow(dead_code)]
-
+use mlua::{Lua, LuaOptions, StdLib};
 use serde_json::Value;
+
+/// Runs a data file (a SavedVariables file, or our own Data.lua) in a fresh
+/// Lua 5.1 with none of the standard library, so all it can do is build
+/// tables. Returns the interpreter, to read the globals the file set.
+pub fn exec(source: &str) -> Result<Lua, String> {
+    let lua = Lua::new_with(StdLib::NONE, LuaOptions::default()).map_err(|e| e.to_string())?;
+    lua.load(source).exec().map_err(|e| e.to_string())?;
+    Ok(lua)
+}
 
 /// Lua's reserved words: these can't be bare keys (`end = 1` is a syntax error).
 pub const KEYWORDS: &[&str] = &[
@@ -34,14 +40,55 @@ pub const KEYWORDS: &[&str] = &[
 
 /// `hello "you"` → `"hello \"you\""`, quotes included.
 pub fn escape_str(s: &str) -> String {
-    let _ = s;
-    todo!("step 6 in GUIDE.md")
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"), // \  → \\
+            '"' => out.push_str("\\\""),  // "  → \"
+            '\n' => out.push_str("\\n"),  // newline → \n
+            // Other control characters → \ddd, always three digits (tab → \009).
+            c if (c as u32) < 32 || c as u32 == 127 => out.push_str(&format!("\\{:03}", c as u32)),
+            // Everything else, accents included, as it is.
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The Lua source for one JSON value (no `name = ` in front).
 pub fn to_lua(value: &Value) -> String {
-    let _ = value;
-    todo!("step 6 in GUIDE.md")
+    match value {
+        Value::Null => "nil".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => escape_str(s),
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(to_lua).collect();
+            format!("{{ {} }}", parts.join(", "))
+        }
+        Value::Object(map) => {
+            let parts: Vec<String> = map
+                .iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| {
+                    // `kind = ...` for plain names, `["Shoop-1795219200-3f2a"] = ...` otherwise.
+                    let key = if is_plain_name(k) { k.clone() } else { format!("[{}]", escape_str(k)) };
+                    format!("{key} = {}", to_lua(v))
+                })
+                .collect();
+            format!("{{ {} }}", parts.join(", "))
+        }
+    }
+}
+
+/// True when `k` can be a bare table key: letters, digits and `_`, not starting
+/// with a digit, and not a Lua keyword.
+fn is_plain_name(k: &str) -> bool {
+    let Some(first) = k.chars().next() else { return false }; // empty
+    !first.is_ascii_digit()
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !KEYWORDS.contains(&k)
 }
 
 #[cfg(test)]

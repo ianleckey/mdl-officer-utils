@@ -1,8 +1,7 @@
-//! Reading one string key out of the addon's SavedVariables file
+//! Reading string keys out of the addon's SavedVariables file
 //! (`WTF/Account/<ACCOUNT>/SavedVariables/MurlocDefenceLeague.lua`).
 //!
-//! The app never parses Lua properly. Everything meant for it is a single
-//! top-level string on one line, like:
+//! The game writes the file as Lua source:
 //!
 //! ```text
 //! MurlocDefenceLeagueDB = {
@@ -10,36 +9,55 @@
 //! }
 //! ```
 //!
-//! READ ONLY: the app must never write this file. See GUIDE.md, step 1.
+//! so the app runs it in a sandboxed Lua (`lua::exec`) and reads the strings it
+//! wants from the `MurlocDefenceLeagueDB` table. Lua itself undoes the escapes.
+//!
+//! READ ONLY: the app must never write this file.
 
-/// Finds `["<key>"] = "...."` in `file_text` and returns the string with the
-/// Lua escapes undone.
-///
-/// * `Ok(None)`: the key isn't there (an older addon, or nothing to say yet).
-///   That's "nothing to do", not an error.
-/// * `Ok(Some(text))`: found it.
-/// * `Err(..)`: the key is there but broken (no closing quote, a bad escape,
-///   or bytes that aren't UTF-8).
+use mlua::{Lua, LuaString, Table};
 
-use mlua::{Lua, LuaOptions, Table, StdLib};
+/// The global the addon saves everything under.
+const DB_GLOBAL: &str = "MurlocDefenceLeagueDB";
 
-pub fn read_key(file_text: &str, key: &str) -> Result<Option<String>, String> {
-    let err = |e: mlua::Error| e.to_string();
-    let lua = Lua::new_with(StdLib::NONE, LuaOptions::default()).map_err(err)?;
-    lua.load(file_text).exec().map_err(err)?;
-    let mdl_data = lua.globals().get::<Table>("MurlocDefenceLeagueDB").map_err(err)?;
-    match mdl_data.get::<Option<mlua::LuaString>>(key).map_err(|e| e.to_string())? {
-        None => Ok(None),
-        Some(s) => Ok(Some(s.to_str().map_err(err)?.to_string())),
+/// One SavedVariables file, run once so several keys can be read from it.
+pub struct SavedVars {
+    /// Kept alive alongside `db`, which points into it.
+    _lua: Lua,
+    /// `None` if the file never sets `MurlocDefenceLeagueDB` (nothing saved yet).
+    db: Option<Table>,
+}
+
+impl SavedVars {
+    /// Runs the file's text. `Err` if it isn't valid Lua: most often the game
+    /// was halfway through writing it.
+    pub fn parse(file_text: &str) -> Result<SavedVars, String> {
+        let lua = crate::lua::exec(file_text)?;
+        let db = lua.globals().get::<Option<Table>>(DB_GLOBAL).map_err(|e| e.to_string())?;
+        Ok(SavedVars { _lua: lua, db })
+    }
+
+    /// The string stored under `["<key>"]`.
+    ///
+    /// * `Ok(None)`: the key isn't there (an older addon, or nothing to say yet).
+    ///   That's "nothing to do", not an error.
+    /// * `Ok(Some(text))`: found it.
+    /// * `Err(..)`: the key holds something that isn't a UTF-8 string.
+    pub fn get(&self, key: &str) -> Result<Option<String>, String> {
+        let Some(db) = &self.db else { return Ok(None) };
+        let Some(value) = db.get::<Option<LuaString>>(key).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        value.to_str().map(|s| Some(s.to_string())).map_err(|e| format!("{key} isn't valid UTF-8: {e}"))
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests: these are your target. Run `cargo test savedvars` and make them pass.
-// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
-    use super::read_key;
+    use super::SavedVars;
+
+    fn read_key(file_text: &str, key: &str) -> Result<Option<String>, String> {
+        SavedVars::parse(file_text)?.get(key)
+    }
 
     /// Builds a file the way the game writes it: tab-indented, one key per line.
     fn file(lines: &[&str]) -> String {
@@ -144,5 +162,19 @@ mod tests {
         // A value that merely *contains* the pattern isn't the key.
         let f = file(&[r#"["note"] = "[\"k\"] = \"fake\"","#]);
         assert_eq!(read_key(&f, "k"), Ok(None));
+    }
+
+    #[test]
+    fn no_saved_table_is_none() {
+        assert_eq!(read_key("SomeOtherAddonDB = {}\n", "murlocExport"), Ok(None));
+        assert_eq!(read_key("", "murlocExport"), Ok(None));
+    }
+
+    #[test]
+    fn several_keys_from_one_parse() {
+        let f = file(&[r#"["murlocExport"] = "m","#, r#"["lfgOutbox"] = "o","#]);
+        let saved = SavedVars::parse(&f).unwrap();
+        assert_eq!(saved.get("murlocExport"), Ok(Some("m".to_string())));
+        assert_eq!(saved.get("lfgOutbox"), Ok(Some("o".to_string())));
     }
 }

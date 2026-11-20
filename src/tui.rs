@@ -31,7 +31,7 @@ use crate::eventlog::{self, Level};
 use crate::game;
 use crate::lfg::Run;
 use crate::{report, schedule};
-use crate::worker::{AccountState, Command, LfgView, Phase, Status, Upload};
+use crate::worker::{AccountState, Command, LfgView, Phase, Service, Status, Upload};
 
 /// What the keyboard is doing right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,33 +241,62 @@ impl Ui {
 const LABEL: Style = Style::new().fg(Color::DarkGray);
 const GOLD: Color = Color::Rgb(0xE6, 0xC2, 0x6E);
 
+/// From this width up, the murloc and group finder panels sit side by side.
+const SIDE_BY_SIDE_MIN_COLS: u16 = 100;
+/// The Events panel always keeps at least this many rows (borders included).
+const EVENTS_MIN_ROWS: u16 = 8;
+/// The group finder panel's smallest useful height: borders, summary, divider, one run.
+const LFG_MIN_ROWS: u16 = 5;
+/// The most leaderboard rows the murloc panel asks room for.
+const WEEK_MAX_ROWS: usize = 10;
+
+/// Full-width header, then the murloc and group finder panels (side by side when
+/// there's room), then full-width Events and footer.
 fn draw(frame: &mut Frame, s: &Status, ui: &Ui) {
-    let tall = frame.area().height >= CREST_MIN_ROWS;
-    let accounts_height = s.accounts.len().max(1) as u16 + 2;
-    let mut header_height = 4 + u16::from(s.addon.is_some()) + u16::from(s.last_error.is_some());
+    let area = frame.area();
+    let tall = area.height >= CREST_MIN_ROWS;
+    let mut header_height = 6 + u16::from(s.addon.is_some()) + u16::from(s.last_error.is_some());
     if tall {
         header_height = header_height.max(art::CREST_SMALL.len() as u16 + 2);
     }
-    let lfg_height = s.lfg.as_ref().map_or(0, |l| l.upcoming.len().max(1) as u16 + 3);
-    let week = week_lines(s);
-    let week_height = week.len() as u16 + 2;
-    let [header, accounts, upload, week_area, lfg, events, footer] = Layout::vertical([
+    let side_by_side = s.lfg.is_some() && area.width >= SIDE_BY_SIDE_MIN_COLS;
+
+    // Rows for the middle section, after the header, footer and Events' minimum.
+    let spare = area.height.saturating_sub(header_height + 1 + EVENTS_MIN_ROWS);
+    // Rows the murloc panel may use: all of them side by side, or what's left above
+    // the group finder when stacked.
+    let murloc_room = if s.lfg.is_some() && !side_by_side { spare.saturating_sub(LFG_MIN_ROWS) } else { spare };
+    let fixed = murloc_lines(s, 0).len() as u16 + 2; // everything except leaderboard names
+    let week_rows = (murloc_room.saturating_sub(fixed) as usize).min(WEEK_MAX_ROWS);
+    let murloc = murloc_lines(s, week_rows);
+    let murloc_height = (murloc.len() as u16 + 2).min(murloc_room);
+    let middle_height = match &s.lfg {
+        // Side by side, the group finder gets the same height (and fills it with runs).
+        Some(_) if side_by_side => murloc_height,
+        Some(view) => (murloc_height + lfg_wanted_rows(view)).min(spare),
+        None => murloc_height,
+    };
+
+    let [header, middle, events, footer] = Layout::vertical([
         Constraint::Length(header_height),
-        Constraint::Length(accounts_height),
-        Constraint::Length(5),
-        Constraint::Length(week_height),
-        Constraint::Length(lfg_height),
-        Constraint::Min(4),
+        Constraint::Length(middle_height),
+        Constraint::Min(0),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
 
     draw_header(frame, header, s, tall);
-    draw_accounts(frame, accounts, s);
-    draw_upload(frame, upload, s);
-    draw_week(frame, week_area, week);
-    if let Some(view) = &s.lfg {
-        draw_lfg(frame, lfg, view);
+    match &s.lfg {
+        Some(view) => {
+            let [murloc_area, lfg_area] = if side_by_side {
+                Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(middle)
+            } else {
+                Layout::vertical([Constraint::Length(murloc_height), Constraint::Min(0)]).areas(middle)
+            };
+            draw_murlocs(frame, murloc_area, s, murloc);
+            draw_lfg(frame, lfg_area, view);
+        }
+        None => draw_murlocs(frame, middle, s, murloc),
     }
     draw_events(frame, events, s, ui.scroll);
     draw_footer(frame, footer, s, ui);
@@ -275,6 +304,23 @@ fn draw(frame: &mut Frame, s: &Status, ui: &Ui) {
     if ui.mode != Mode::Normal {
         draw_input(frame, events, ui);
     }
+}
+
+/// A thin labelled rule between a panel's sections: `── Last upload ─────…`.
+/// It's longer than any terminal; the panel cuts it to fit.
+fn divider(title: &str) -> Line<'static> {
+    Line::styled(format!("── {title} {}", "─".repeat(300)), LABEL)
+}
+
+/// The title-bar status a feature panel shows in its top-right corner.
+fn status_title(service: &Service) -> Line<'static> {
+    let (text, colour) = match service {
+        Service::Unknown => ("not asked yet".into(), Color::DarkGray),
+        Service::Ok => ("website ✓".into(), Color::Green),
+        Service::NotOnSite => ("not on the website yet".into(), Color::Yellow),
+        other => service_text(other),
+    };
+    Line::styled(format!(" {text} "), colour).right_aligned()
 }
 
 fn panel(title: &str) -> Block<'_> {
@@ -286,7 +332,7 @@ fn panel(title: &str) -> Block<'_> {
 
 fn draw_header(frame: &mut Frame, area: Rect, s: &Status, with_crest: bool) {
     let (badge, colour) = badge(s);
-    let block = panel(concat!("Murloc Defence League · desktop app ", env!("CARGO_PKG_VERSION")))
+    let block = panel(concat!("Murloc Defence League · officer utils ", env!("CARGO_PKG_VERSION")))
         .title_top(Line::from(Span::styled(format!(" {badge} "), Style::new().fg(Color::Black).bg(colour).bold())).right_aligned());
     let block = match &s.update {
         Some(u) => block.title_top(
@@ -312,6 +358,7 @@ fn draw_header(frame: &mut Frame, area: Rect, s: &Status, with_crest: bool) {
             Span::raw(s.game_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(dash)),
         ]),
     ];
+    lines.extend(website_lines(s));
     if let Some(addon) = &s.addon {
         lines.push(addon_line(addon));
     }
@@ -333,7 +380,61 @@ fn draw_header(frame: &mut Frame, area: Rect, s: &Status, with_crest: bool) {
     }
 }
 
-/// "Addon  1.2.0 · 1.4.0 available" (step 13).
+/// The website's health, then each feature's state:
+///
+/// ```text
+/// Website       murlocdefenseleague.org · answered 12s ago in 180 ms
+///               uploads ✓ · group finder not on site yet · addon versions ✓
+/// ```
+///
+/// The group finder only appears while it's switched on.
+fn website_lines(s: &Status) -> [Line<'static>; 2] {
+    let w = &s.website;
+    let health = match (w.reachable, w.last_answer) {
+        (None, _) => Span::styled("not contacted yet", LABEL),
+        (Some(true), Some(at)) => {
+            let took = w.last_latency.map(|d| format!(" in {} ms", d.as_millis())).unwrap_or_default();
+            Span::styled(format!("answered {} ago{took}", ago(at)), Color::Green)
+        }
+        (Some(_), Some(at)) => Span::styled(format!("no answer for {}", ago(at)), Color::LightRed),
+        (Some(_), None) => Span::styled("no answer yet", Color::LightRed),
+    };
+    let first =
+        Line::from(vec![Span::styled("Website       ", LABEL), Span::raw(w.host.clone()), Span::styled(" · ", LABEL), health]);
+
+    let mut features = vec![("uploads", &w.uploads)];
+    if let Some(lfg) = &s.lfg {
+        features.push(("group finder", &lfg.service));
+    }
+    features.push(("addon versions", &w.addon_versions));
+    let mut spans = vec![Span::raw("              ")];
+    for (i, (name, service)) in features.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", LABEL));
+        }
+        let (text, colour) = service_text(service);
+        spans.push(Span::raw(format!("{name} ")));
+        spans.push(Span::styled(text, colour));
+    }
+    [first, Line::from(spans)]
+}
+
+/// One website feature's state, short enough to sit several to a line.
+fn service_text(service: &Service) -> (String, Color) {
+    match service {
+        Service::Unknown => ("–".into(), Color::DarkGray),
+        Service::Ok => ("✓".into(), Color::Green),
+        Service::NotOnSite => ("not on site yet".into(), Color::DarkGray),
+        Service::Unreachable => ("✗ unreachable".into(), Color::LightRed),
+        Service::RateLimited(until) => {
+            let left = until.saturating_duration_since(Instant::now()).as_secs();
+            (format!("◷ busy, retry in {}", short_duration(left)), Color::Yellow)
+        }
+        Service::Refused => ("✗ token refused".into(), Color::LightRed),
+    }
+}
+
+/// "Addon  1.2.0 · 1.4.0 available".
 fn addon_line(a: &AddonView) -> Line<'static> {
     let mut spans = vec![Span::styled("Guild addon   ", LABEL)];
     match a.installed {
@@ -392,11 +493,13 @@ fn countdown(s: &Status) -> Option<String> {
     Some(if left == 0 { "now".into() } else { format!("in {}", short_duration(left)) })
 }
 
-fn draw_accounts(frame: &mut Frame, area: Rect, s: &Status) {
-    let width = s.accounts.iter().map(|a| a.name.len()).max().unwrap_or(0) + 3;
-    let lines: Vec<Line> = if s.accounts.is_empty() {
+/// Everything about the Impact Report figures: each account, the last upload,
+/// and this week's leaderboard (up to `week_rows` names).
+fn murloc_lines(s: &Status, week_rows: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = if s.accounts.is_empty() {
         vec![Line::styled("No accounts with the addon's saved data yet.", LABEL)]
     } else {
+        let width = s.accounts.iter().map(|a| a.name.len()).max().unwrap_or(0) + 3;
         s.accounts
             .iter()
             .map(|a| {
@@ -405,7 +508,19 @@ fn draw_accounts(frame: &mut Frame, area: Rect, s: &Status) {
             })
             .collect()
     };
-    frame.render_widget(Paragraph::new(lines).block(panel("Accounts")), area);
+    lines.push(divider("Last upload"));
+    match &s.last_upload {
+        None => lines.push(Line::styled("Nothing uploaded since the app started.", LABEL)),
+        Some(u) => lines.extend(upload_lines(u)),
+    }
+    lines.push(divider("This week's murloc slayers"));
+    lines.extend(week_lines(s, week_rows));
+    lines
+}
+
+fn draw_murlocs(frame: &mut Frame, area: Rect, s: &Status, lines: Vec<Line<'static>>) {
+    let block = panel("Murloc figures").title_top(status_title(&s.website.uploads));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn account_text(state: &AccountState) -> (String, Color) {
@@ -423,14 +538,6 @@ fn account_text(state: &AccountState) -> (String, Color) {
         AccountState::Rejected(msg) => (format!("✗ {msg}"), Color::LightRed),
         AccountState::ReadError(msg) => (format!("✗ {msg}"), Color::LightRed),
     }
-}
-
-fn draw_upload(frame: &mut Frame, area: Rect, s: &Status) {
-    let lines = match &s.last_upload {
-        None => vec![Line::styled("Nothing uploaded since the app started.", LABEL)],
-        Some(u) => upload_lines(u),
-    };
-    frame.render_widget(Paragraph::new(lines).block(panel("Last upload")), area);
 }
 
 fn upload_lines(u: &Upload) -> Vec<Line<'static>> {
@@ -459,26 +566,42 @@ fn upload_lines(u: &Upload) -> Vec<Line<'static>> {
     lines
 }
 
-/// Phase 2: the next few runs, and how sign-ups are moving.
+/// Rows the group finder panel would like: borders, summary, divider, and a line per run.
+fn lfg_wanted_rows(view: &LfgView) -> u16 {
+    view.upcoming.len().max(1) as u16 + 4
+}
+
+/// Phase 2: how sign-ups are moving, then as many upcoming runs as fit.
 fn draw_lfg(frame: &mut Frame, area: Rect, view: &LfgView) {
     let last = view.last_poll.map_or("never".to_string(), |t| format!("{} ago", ago(t)));
-    let mut lines = vec![Line::from(vec![
-        Span::styled("Runs ", LABEL),
-        Span::raw(view.runs_known.to_string()),
-        Span::styled(" · sign-ups relayed ", LABEL),
-        Span::raw(view.signups_sent.to_string()),
-        Span::styled(" · waiting to send ", LABEL),
-        Span::raw(view.pending.to_string()),
-        Span::styled(" · last checked ", LABEL),
-        Span::raw(last),
-    ])];
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Runs ", LABEL),
+            Span::raw(view.runs_known.to_string()),
+            Span::styled(" · sign-ups relayed ", LABEL),
+            Span::raw(view.signups_sent.to_string()),
+            Span::styled(" · waiting to send ", LABEL),
+            Span::raw(view.pending.to_string()),
+            Span::styled(" · last checked ", LABEL),
+            Span::raw(last),
+        ]),
+        divider("Upcoming runs"),
+    ];
+    // Room for runs: the panel less its borders and the two lines above.
+    let room = (area.height as usize).saturating_sub(4);
     if view.upcoming.is_empty() {
         lines.push(Line::styled("No upcoming runs from the website yet.", LABEL));
+    } else if view.upcoming.len() <= room {
+        lines.extend(view.upcoming.iter().map(run_line));
+    } else {
+        // Keep the last line for how many didn't fit.
+        let shown = room.saturating_sub(1);
+        lines.extend(view.upcoming.iter().take(shown).map(run_line));
+        lines.push(Line::styled(format!("…and {} more", view.upcoming.len() - shown), LABEL));
     }
-    for run in &view.upcoming {
-        lines.push(run_line(run));
-    }
-    frame.render_widget(Paragraph::new(lines).block(panel("Group finder")), area);
+    // The website's state in the corner, so "no runs" can't be mistaken for "all fine".
+    let block = panel("Group finder").title_top(status_title(&view.service));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// "Sat 20:00  The Stockade  3/5" (with "demo" marked).
@@ -526,18 +649,19 @@ fn draw_events(frame: &mut Frame, area: Rect, s: &Status, scroll: usize) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// The "This week" panel's lines: the nudge (if any), then the top five.
-fn week_lines(s: &Status) -> Vec<Line<'static>> {
+/// The leaderboard's lines: the Wednesday nudge (if any), then the top `max_rows` names.
+fn week_lines(s: &Status, max_rows: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let exported_at = s.report.as_ref().map(|r| r.exported_at);
     if let Some(text) = schedule::nudge(Timestamp::now(), exported_at) {
         lines.push(Line::styled(format!("! {text}"), Color::Yellow));
     }
     match &s.report {
-        None => lines.push(Line::styled(
-            s.report_note.clone().unwrap_or_else(|| "No murloc figures read yet.".into()),
-            LABEL,
-        )),
+        // The parse error itself is in Events; it's too technical for here.
+        None if s.report_note.is_some() => {
+            lines.push(Line::styled("Couldn't read this week's figures (details in Events).", Color::Yellow))
+        }
+        None => lines.push(Line::styled("No murloc figures read yet.", LABEL)),
         Some(r) => match report::latest_week(r) {
             None => lines.push(Line::styled("The export has no weeks in it yet.", LABEL)),
             Some(week) => {
@@ -545,47 +669,22 @@ fn week_lines(s: &Status) -> Vec<Line<'static>> {
                 if rows.is_empty() {
                     lines.push(Line::styled("Nobody's harmed a murloc this week. Yet.", LABEL));
                 }
-                let width = rows.iter().take(5).map(|r| r.character.chars().count()).max().unwrap_or(0) + 2;
-                for (i, row) in rows.iter().take(5).enumerate() {
-                    let mut spans = vec![
+                let width = rows.iter().take(max_rows).map(|r| r.character.chars().count()).max().unwrap_or(0) + 2;
+                for (i, row) in rows.iter().take(max_rows).enumerate() {
+                    let spans = vec![
                         Span::styled(format!("{}. ", i + 1), Style::new().fg(GOLD)),
                         Span::raw(format!("{:<width$}", row.character)),
                         Span::styled(format!("{:>4}", row.kills), Style::new().add_modifier(Modifier::BOLD)),
                     ];
-                    if let Some(m) = &row.top_murloc {
-                        spans.push(Span::styled(format!("   favourite victim: {m}"), LABEL));
-                    }
                     lines.push(Line::from(spans));
                 }
-                if rows.len() > 5 {
-                    lines.push(Line::styled(format!("…and {} more", rows.len() - 5), LABEL));
+                if rows.len() > max_rows {
+                    lines.push(Line::styled(format!("…and {} more", rows.len() - max_rows), LABEL));
                 }
             }
         },
     }
     lines
-}
-
-fn draw_week(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
-    let post = match schedule::next_discord_post(Timestamp::now()) {
-        Some(at) => {
-            let secs = at.timestamp().as_second() - Timestamp::now().as_second();
-            format!(" Discord post in {} ", long_duration(secs.max(0) as u64))
-        }
-        None => " Discord countdown: step 12 isn't written yet ".into(),
-    };
-    let block = panel("This week's murloc slayers").title_top(Line::styled(post, LABEL).right_aligned());
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// "2d 4h", "3h 20m", "12m"
-fn long_duration(s: u64) -> String {
-    let (d, h, m) = (s / 86400, (s % 86400) / 3600, (s % 3600) / 60);
-    match (d, h) {
-        (0, 0) => format!("{m}m"),
-        (0, _) => format!("{h}h {m}m"),
-        _ => format!("{d}d {h}h"),
-    }
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, s: &Status, ui: &Ui) {
@@ -786,7 +885,10 @@ mod tests {
             signups_sent: 4,
             pending: 1,
             last_poll: Some(SystemTime::now()),
+            service: Service::RateLimited(Instant::now() + std::time::Duration::from_secs(42)),
         });
+        s.website.uploads = Service::Ok;
+        s.website.addon_versions = Service::NotOnSite;
         s.update = Some(crate::update::UpdateInfo {
             version: crate::version::Version::parse("0.2.0").unwrap(),
             url: "https://github.com/ianleckey/mdl-officer-utils/releases/tag/v0.2.0".into(),
@@ -798,13 +900,75 @@ mod tests {
             too_old_for_murlocs: crate::version::Version::parse("1.3.0"),
             url: Some("https://murlocdefenseleague.org/addon".into()),
         });
-        s.report_note = Some(crate::report::NOT_WRITTEN.into());
+        s.report = crate::report::parse_export(
+            "MDLMURLOCS;1;1795219200;Shoop Dahoop\nW;1794974400;Shoop Dahoop;156\nW;1794974400;Renée Silver;98\n\
+             W;1794974400;Gotrek Rustpeak;41\nW;1794974400;Kat Whisker;0",
+        )
+        .ok();
+        s.website.host = "murlocdefenseleague.org".into();
+        s.website.reachable = Some(true);
+        s.website.last_answer = Some(SystemTime::now());
+        s.website.last_latency = Some(std::time::Duration::from_millis(182));
         println!("{}", screen(&s, &ui(Mode::Normal, "")));
-        println!("{}", screen_sized(&s, &ui(Mode::Normal, ""), 110, 44));
+        println!("{}", screen_sized(&s, &ui(Mode::Normal, ""), 160, 45));
+        println!("{}", screen_sized(&s, &ui(Mode::Normal, ""), 90, 40));
 
         let mut term = Terminal::new(TestBackend::new(110, 24)).unwrap();
         term.draw(draw_splash).unwrap();
         println!("{}", buffer_text(term.backend().buffer()));
+    }
+
+    fn with_lfg(mut s: Status) -> Status {
+        s.lfg = Some(LfgView { service: Service::NotOnSite, ..LfgView::default() });
+        s
+    }
+
+    /// The screen row a piece of text first appears on.
+    fn row_of(text: &str, needle: &str) -> Option<usize> {
+        text.lines().position(|l| l.contains(needle))
+    }
+
+    #[test]
+    fn wide_puts_the_panels_side_by_side() {
+        let text = screen_sized(&with_lfg(sample()), &ui(Mode::Normal, ""), 160, 45);
+        assert!(row_of(&text, "Murloc figures").is_some());
+        assert_eq!(row_of(&text, "Murloc figures"), row_of(&text, "Group finder"), "{text}");
+        assert!(text.contains("not on the website yet"), "{text}");
+    }
+
+    #[test]
+    fn narrow_stacks_them() {
+        let text = screen_sized(&with_lfg(sample()), &ui(Mode::Normal, ""), 90, 40);
+        let (murloc, lfg) = (row_of(&text, "Murloc figures").unwrap(), row_of(&text, "Group finder").unwrap());
+        assert!(murloc < lfg, "{text}");
+    }
+
+    #[test]
+    fn group_finder_off_means_no_panel() {
+        let text = screen_sized(&sample(), &ui(Mode::Normal, ""), 160, 45);
+        assert!(text.contains("Murloc figures"));
+        assert!(!text.contains("Group finder"), "{text}");
+    }
+
+    #[test]
+    fn tiny_terminal_doesnt_panic() {
+        for (w, h) in [(40, 12), (20, 5), (1, 1), (0, 0)] {
+            screen_sized(&with_lfg(sample()), &ui(Mode::Normal, ""), w, h);
+        }
+    }
+
+    #[test]
+    fn website_health_line() {
+        let mut s = sample();
+        s.website.host = "127.0.0.1:8787".into();
+        s.website.reachable = Some(true);
+        s.website.last_answer = Some(SystemTime::now());
+        let text = screen_sized(&s, &ui(Mode::Normal, ""), 160, 45);
+        assert!(text.contains("127.0.0.1:8787") && text.contains("answered 0s ago"), "{text}");
+
+        s.website.reachable = Some(false);
+        let text = screen_sized(&s, &ui(Mode::Normal, ""), 160, 45);
+        assert!(text.contains("no answer for"), "{text}");
     }
 
     #[test]
